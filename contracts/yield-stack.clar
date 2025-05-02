@@ -44,6 +44,7 @@
 (define-data-var min-deposit uint u100000) ;; Minimum deposit in sats
 (define-data-var max-deposit uint u1000000000) ;; Maximum deposit in sats
 (define-data-var emergency-shutdown bool false)
+(define-data-var mutex uint u0)
 
 ;; DATA MAPS
 (define-map user-deposits 
@@ -81,6 +82,15 @@
 ;; AUTHORIZATION FUNCTIONS
 (define-private (is-contract-owner)
     (is-eq tx-sender contract-owner)
+)
+
+;; Define the is-contract function to check if a principal is a contract
+(define-private (is-contract (principal-to-check principal))
+    (let ((principal-string (unwrap-panic (to-consensus-buff? principal-to-check))))
+        ;; Check if the principal is a contract by looking at its form
+        ;; Contracts have a specific format that includes a deployment transaction ID
+        (is-some (index-of principal-string 0x2e)) ;; '.' character in hex indicates a contract principal
+    )
 )
 
 ;; VALIDATION FUNCTIONS
@@ -168,11 +178,18 @@
             (token-contract (contract-of token-trait))
             (token-info (map-get? whitelisted-tokens { token: token-contract }))
         )
+        ;; First check if token is in whitelist
         (asserts! (is-some token-info) ERR-TOKEN-NOT-WHITELISTED)
         (asserts! (get approved (unwrap-panic token-info)) ERR-PROTOCOL-NOT-WHITELISTED)
-        (ok true)
+        
+        ;; Additional validation - verify the token implements SIP-010 correctly
+        (asserts! (is-ok (contract-call? token-trait get-name)) ERR-INVALID-TOKEN)
+        (asserts! (is-ok (contract-call? token-trait get-symbol)) ERR-INVALID-TOKEN)
+        
+        (ok token-contract)
     )
 )
+
 
 ;; DEPOSIT AND WITHDRAWAL FUNCTIONS
 (define-public (deposit (token-trait <sip-010-trait>) (amount uint))
@@ -181,17 +198,15 @@
             (user-principal tx-sender)
             (current-deposit (default-to { amount: u0, last-deposit-block: u0 } 
                 (map-get? user-deposits { user: user-principal })))
+            ;; Validate token first and capture the result
+            (validated-token (try! (validate-token token-trait)))
         )
-        ;; Validate token and check deposit constraints
-        (try! (validate-token token-trait))
+        ;; Checks
         (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
         (asserts! (>= amount (var-get min-deposit)) ERR-MIN-DEPOSIT-NOT-MET)
         (asserts! (<= (+ amount (get amount current-deposit)) (var-get max-deposit)) ERR-MAX-DEPOSIT-REACHED)
         
-        ;; Safely transfer tokens to contract
-        (try! (safe-token-transfer token-trait amount user-principal (as-contract tx-sender)))
-        
-        ;; Update user deposits
+        ;; Effects - Update state before interactions
         (map-set user-deposits 
             { user: user-principal }
             { 
@@ -199,11 +214,17 @@
                 last-deposit-block: stacks-block-height
             })
         
-        ;; Update TVL
         (var-set total-tvl (+ (var-get total-tvl) amount))
+        
+        ;; Interactions - Transfer tokens last
+        (try! (contract-call? token-trait transfer amount user-principal (as-contract tx-sender) none))
         
         ;; Rebalance protocols if needed
         (try! (rebalance-protocols))
+        
+        ;; Emit event for off-chain tracking
+        (print { event: "deposit", user: user-principal, token: validated-token, amount: amount })
+        
         (ok true)
     )
 )
@@ -214,12 +235,12 @@
             (user-principal tx-sender)
             (current-deposit (default-to { amount: u0, last-deposit-block: u0 }
                 (map-get? user-deposits { user: user-principal })))
+            (validated-token (try! (validate-token token-trait)))
         )
-        ;; Validate token and check withdrawal constraints
-        (try! (validate-token token-trait))
+        ;; Checks
         (asserts! (<= amount (get amount current-deposit)) ERR-INSUFFICIENT-BALANCE)
         
-        ;; Update user deposits
+        ;; Effects - Update state before interactions
         (map-set user-deposits
             { user: user-principal }
             {
@@ -227,12 +248,14 @@
                 last-deposit-block: (get last-deposit-block current-deposit)
             })
         
-        ;; Update TVL
         (var-set total-tvl (- (var-get total-tvl) amount))
         
-        ;; Safely transfer tokens back to user
+        ;; Interactions - External calls come last
         (as-contract
-            (try! (safe-token-transfer token-trait amount tx-sender user-principal)))
+            (try! (contract-call? token-trait transfer amount tx-sender user-principal none)))
+        
+        ;; Emit event
+        (print { event: "withdraw", user: user-principal, token: validated-token, amount: amount })
         
         (ok true)
     )
@@ -240,11 +263,12 @@
 
 ;; TOKEN TRANSFER FUNCTIONS
 (define-private (safe-token-transfer (token-trait <sip-010-trait>) (amount uint) (sender principal) (recipient principal))
-    (begin
-        (try! (validate-token token-trait))
+    (let ((validated-token (try! (validate-token token-trait))))
+        ;; We've now validated the token contract, so proceed with transfer
         (contract-call? token-trait transfer amount sender recipient none)
     )
 )
+
 
 ;; YIELD AND REWARDS FUNCTIONS
 (define-private (calculate-rewards (user principal) (blocks uint))
@@ -262,29 +286,42 @@
     (let
         (
             (user-principal tx-sender)
-            (rewards (calculate-rewards user-principal (- stacks-block-height 
-                (get last-deposit-block (unwrap-panic (get-user-deposit user-principal))))))
+            (validated-token (try! (validate-token token-trait)))
+            (user-deposit (unwrap-panic (get-user-deposit user-principal)))
+            (blocks-passed (- stacks-block-height (get last-deposit-block user-deposit)))
+            (rewards (calculate-rewards user-principal blocks-passed))
+            (current-rewards (default-to { pending: u0, claimed: u0 }
+                        (map-get? user-rewards { user: user-principal })))
         )
-        (try! (validate-token token-trait))
+        ;; Checks
         (asserts! (> rewards u0) ERR-INVALID-AMOUNT)
         
-        ;; Update rewards map
+        ;; Effects - Update state before interactions
         (map-set user-rewards
             { user: user-principal }
             {
                 pending: u0,
-                claimed: (+ rewards 
-                    (get claimed (default-to { pending: u0, claimed: u0 }
-                        (map-get? user-rewards { user: user-principal }))))
+                claimed: (+ rewards (get claimed current-rewards))
             })
         
-        ;; Transfer rewards
+        ;; Update last-deposit-block to reset rewards calculation
+        (map-set user-deposits
+            { user: user-principal }
+            {
+                amount: (get amount user-deposit),
+                last-deposit-block: stacks-block-height
+            })
+        
+        ;; Interactions - Transfer rewards last
         (as-contract
             (try! (contract-call? token-trait transfer
                 rewards
                 tx-sender
                 user-principal
                 none)))
+        
+        ;; Emit event
+        (print { event: "claim-rewards", user: user-principal, token: validated-token, amount: rewards })
         
         (ok rewards)
     )
@@ -357,7 +394,17 @@
 (define-public (whitelist-token (token principal))
     (begin
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        
+        ;; Minimal validation - in practice would need more checks to ensure
+        ;; token implements SIP-010 trait properly
+        (asserts! (is-contract token) ERR-INVALID-TOKEN)
+        
+        ;; Set token as approved
         (map-set whitelisted-tokens { token: token } { approved: true })
+        
+        ;; Emit event
+        (print { event: "whitelist-token", token: token })
+        
         (ok true)
     )
 )
@@ -370,4 +417,19 @@
 (define-private (get-protocol-allocation (protocol-id uint))
     (get allocation (default-to { allocation: u0 }
         (map-get? strategy-allocations { protocol-id: protocol-id })))
+)
+
+(define-private (acquire-mutex)
+    (begin
+        (asserts! (is-eq (var-get mutex) u0) (err u2000)) ;; ERR-REENTRANT
+        (var-set mutex u1)
+        (ok true)
+    )
+)
+
+(define-private (release-mutex)
+    (begin
+        (var-set mutex u0)
+        (ok true)
+    )
 )
