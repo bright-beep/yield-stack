@@ -28,6 +28,9 @@
 (define-constant ERR-INVALID-NAME (err u1010))
 (define-constant ERR-INVALID-TOKEN (err u1011))
 (define-constant ERR-TOKEN-NOT-WHITELISTED (err u1012))
+(define-constant ERR-REENTRANT (err u2000))
+(define-constant ERR-MUTEX-LOCKED (err u2001))
+(define-constant ERR-MUTEX-UNLOCKED (err u2002))
 
 ;; Protocol status constants
 (define-constant PROTOCOL-ACTIVE true)
@@ -50,6 +53,10 @@
 (define-map user-deposits 
     { user: principal } 
     { amount: uint, last-deposit-block: uint })
+
+(define-map tx-validated-tokens
+    { token: principal }
+    { validated: bool })
 
 (define-map user-rewards 
     { user: principal } 
@@ -185,6 +192,14 @@
         ;; Additional validation - verify the token implements SIP-010 correctly
         (asserts! (is-ok (contract-call? token-trait get-name)) ERR-INVALID-TOKEN)
         (asserts! (is-ok (contract-call? token-trait get-symbol)) ERR-INVALID-TOKEN)
+        (asserts! (is-ok (contract-call? token-trait get-decimals)) ERR-INVALID-TOKEN)
+        (asserts! (is-ok (contract-call? token-trait get-total-supply)) ERR-INVALID-TOKEN)
+        
+        ;; Additional check to ensure token contract is actually a contract
+        (asserts! (is-contract token-contract) ERR-INVALID-TOKEN)
+        
+        ;; Store validated token in map for current tx
+        (map-set tx-validated-tokens { token: token-contract } { validated: true })
         
         (ok token-contract)
     )
@@ -193,71 +208,98 @@
 
 ;; DEPOSIT AND WITHDRAWAL FUNCTIONS
 (define-public (deposit (token-trait <sip-010-trait>) (amount uint))
-    (let
-        (
-            (user-principal tx-sender)
-            (current-deposit (default-to { amount: u0, last-deposit-block: u0 } 
-                (map-get? user-deposits { user: user-principal })))
-            ;; Validate token first and capture the result
-            (validated-token (try! (validate-token token-trait)))
+    (begin
+        ;; Use acquire-mutex to prevent reentrancy attacks
+        (try! (acquire-mutex))
+        
+        (let
+            ((result (let
+                (
+                    (user-principal tx-sender)
+                    (current-deposit (default-to { amount: u0, last-deposit-block: u0 } 
+                        (map-get? user-deposits { user: user-principal })))
+                    ;; Validate token first and capture the result
+                    (validated-token (try! (validate-token token-trait)))
+                )
+                ;; Checks
+                (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
+                (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+                (asserts! (>= amount (var-get min-deposit)) ERR-MIN-DEPOSIT-NOT-MET)
+                (asserts! (<= (+ amount (get amount current-deposit)) (var-get max-deposit)) ERR-MAX-DEPOSIT-REACHED)
+                
+                ;; Effects - Update state before interactions
+                (map-set user-deposits 
+                    { user: user-principal }
+                    { 
+                        amount: (+ amount (get amount current-deposit)),
+                        last-deposit-block: stacks-block-height
+                    })
+                
+                (var-set total-tvl (+ (var-get total-tvl) amount))
+                
+                ;; Interactions - Transfer tokens last, using the validated token contract
+                (try! (contract-call? token-trait transfer amount user-principal (as-contract tx-sender) none))
+                
+                ;; Rebalance protocols if needed
+                (try! (rebalance-protocols))
+                
+                ;; Emit event for off-chain tracking
+                (print { event: "deposit", user: user-principal, token: validated-token, amount: amount })
+                
+                (ok true)
+            )))
+            
+            ;; Release mutex regardless of success or failure
+            (var-set mutex u0)
+            
+            result
         )
-        ;; Checks
-        (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
-        (asserts! (>= amount (var-get min-deposit)) ERR-MIN-DEPOSIT-NOT-MET)
-        (asserts! (<= (+ amount (get amount current-deposit)) (var-get max-deposit)) ERR-MAX-DEPOSIT-REACHED)
-        
-        ;; Effects - Update state before interactions
-        (map-set user-deposits 
-            { user: user-principal }
-            { 
-                amount: (+ amount (get amount current-deposit)),
-                last-deposit-block: stacks-block-height
-            })
-        
-        (var-set total-tvl (+ (var-get total-tvl) amount))
-        
-        ;; Interactions - Transfer tokens last
-        (try! (contract-call? token-trait transfer amount user-principal (as-contract tx-sender) none))
-        
-        ;; Rebalance protocols if needed
-        (try! (rebalance-protocols))
-        
-        ;; Emit event for off-chain tracking
-        (print { event: "deposit", user: user-principal, token: validated-token, amount: amount })
-        
-        (ok true)
     )
 )
 
 (define-public (withdraw (token-trait <sip-010-trait>) (amount uint))
-    (let
-        (
-            (user-principal tx-sender)
-            (current-deposit (default-to { amount: u0, last-deposit-block: u0 }
-                (map-get? user-deposits { user: user-principal })))
-            (validated-token (try! (validate-token token-trait)))
+    (begin
+        ;; Use acquire-mutex to prevent reentrancy attacks
+        (try! (acquire-mutex))
+        
+        (let
+            ((result (let
+                (
+                    (user-principal tx-sender)
+                    (current-deposit (default-to { amount: u0, last-deposit-block: u0 }
+                        (map-get? user-deposits { user: user-principal })))
+                    (validated-token (try! (validate-token token-trait)))
+                )
+                ;; Checks
+                (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+                (asserts! (<= amount (get amount current-deposit)) ERR-INSUFFICIENT-BALANCE)
+                (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
+                
+                ;; Effects - Update state before interactions
+                (map-set user-deposits
+                    { user: user-principal }
+                    {
+                        amount: (- (get amount current-deposit) amount),
+                        last-deposit-block: (get last-deposit-block current-deposit)
+                    })
+                
+                (var-set total-tvl (- (var-get total-tvl) amount))
+                
+                ;; Interactions - External calls come last with validated token
+                (as-contract
+                    (try! (contract-call? token-trait transfer amount tx-sender user-principal none)))
+                
+                ;; Emit event
+                (print { event: "withdraw", user: user-principal, token: validated-token, amount: amount })
+                
+                (ok true)
+            )))
+            
+            ;; Release mutex regardless of success or failure
+            (var-set mutex u0)
+            
+            result
         )
-        ;; Checks
-        (asserts! (<= amount (get amount current-deposit)) ERR-INSUFFICIENT-BALANCE)
-        
-        ;; Effects - Update state before interactions
-        (map-set user-deposits
-            { user: user-principal }
-            {
-                amount: (- (get amount current-deposit) amount),
-                last-deposit-block: (get last-deposit-block current-deposit)
-            })
-        
-        (var-set total-tvl (- (var-get total-tvl) amount))
-        
-        ;; Interactions - External calls come last
-        (as-contract
-            (try! (contract-call? token-trait transfer amount tx-sender user-principal none)))
-        
-        ;; Emit event
-        (print { event: "withdraw", user: user-principal, token: validated-token, amount: amount })
-        
-        (ok true)
     )
 )
 
@@ -283,47 +325,68 @@
 )
 
 (define-public (claim-rewards (token-trait <sip-010-trait>))
-    (let
-        (
-            (user-principal tx-sender)
-            (validated-token (try! (validate-token token-trait)))
-            (user-deposit (unwrap-panic (get-user-deposit user-principal)))
-            (blocks-passed (- stacks-block-height (get last-deposit-block user-deposit)))
-            (rewards (calculate-rewards user-principal blocks-passed))
-            (current-rewards (default-to { pending: u0, claimed: u0 }
-                        (map-get? user-rewards { user: user-principal })))
+    (begin
+        ;; Use acquire-mutex to prevent reentrancy attacks
+        (try! (acquire-mutex))
+        
+        (let
+            ((result (let
+                (
+                    (user-principal tx-sender)
+                    (validated-token (try! (validate-token token-trait)))
+                    (user-deposit-opt (get-user-deposit user-principal))
+                )
+                ;; Check if user has deposits
+                (asserts! (is-some user-deposit-opt) ERR-INSUFFICIENT-BALANCE)
+                
+                (let
+                    (
+                        (user-deposit (unwrap-panic user-deposit-opt))
+                        (blocks-passed (- stacks-block-height (get last-deposit-block user-deposit)))
+                        (rewards (calculate-rewards user-principal blocks-passed))
+                        (current-rewards (default-to { pending: u0, claimed: u0 }
+                                    (map-get? user-rewards { user: user-principal })))
+                    )
+                    ;; Checks
+                    (asserts! (> rewards u0) ERR-INVALID-AMOUNT)
+                    (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
+                    
+                    ;; Effects - Update state before interactions
+                    (map-set user-rewards
+                        { user: user-principal }
+                        {
+                            pending: u0,
+                            claimed: (+ rewards (get claimed current-rewards))
+                        })
+                    
+                    ;; Update last-deposit-block to reset rewards calculation
+                    (map-set user-deposits
+                        { user: user-principal }
+                        {
+                            amount: (get amount user-deposit),
+                            last-deposit-block: stacks-block-height
+                        })
+                    
+                    ;; Interactions - Transfer rewards with validated token
+                    (as-contract
+                        (try! (contract-call? token-trait transfer
+                            rewards
+                            tx-sender
+                            user-principal
+                            none)))
+                    
+                    ;; Emit event
+                    (print { event: "claim-rewards", user: user-principal, token: validated-token, amount: rewards })
+                    
+                    (ok rewards)
+                )
+            )))
+            
+            ;; Release mutex regardless of success or failure
+            (var-set mutex u0)
+            
+            result
         )
-        ;; Checks
-        (asserts! (> rewards u0) ERR-INVALID-AMOUNT)
-        
-        ;; Effects - Update state before interactions
-        (map-set user-rewards
-            { user: user-principal }
-            {
-                pending: u0,
-                claimed: (+ rewards (get claimed current-rewards))
-            })
-        
-        ;; Update last-deposit-block to reset rewards calculation
-        (map-set user-deposits
-            { user: user-principal }
-            {
-                amount: (get amount user-deposit),
-                last-deposit-block: stacks-block-height
-            })
-        
-        ;; Interactions - Transfer rewards last
-        (as-contract
-            (try! (contract-call? token-trait transfer
-                rewards
-                tx-sender
-                user-principal
-                none)))
-        
-        ;; Emit event
-        (print { event: "claim-rewards", user: user-principal, token: validated-token, amount: rewards })
-        
-        (ok rewards)
     )
 )
 
@@ -421,7 +484,7 @@
 
 (define-private (acquire-mutex)
     (begin
-        (asserts! (is-eq (var-get mutex) u0) (err u2000)) ;; ERR-REENTRANT
+        (asserts! (is-eq (var-get mutex) u0) ERR-MUTEX-LOCKED)
         (var-set mutex u1)
         (ok true)
     )
@@ -429,6 +492,7 @@
 
 (define-private (release-mutex)
     (begin
+        (asserts! (is-eq (var-get mutex) u1) ERR-MUTEX-UNLOCKED)
         (var-set mutex u0)
         (ok true)
     )
